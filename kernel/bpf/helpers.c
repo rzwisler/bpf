@@ -2177,6 +2177,94 @@ __bpf_kfunc struct task_struct *bpf_task_from_pid(s32 pid)
 	return p;
 }
 
+/**
+ * bpf_dynptr_slice - Obtain a read-only pointer to the dynptr data.
+ *
+ * For non-skb and non-xdp type dynptrs, there is no difference between
+ * bpf_dynptr_slice and bpf_dynptr_data.
+ *
+ * If the intention is to write to the data slice, please use
+ * bpf_dynptr_slice_rdwr.
+ *
+ * @ptr: The dynptr whose data slice to retrieve
+ * @offset: Offset into the dynptr
+ * @buffer: User-provided buffer to copy contents into
+ * @buffer__sz: Size (in bytes) of the buffer. This is the length of the
+ * requested slice
+ *
+ * @returns: NULL if the call failed (eg invalid dynptr), pointer to a read-only
+ * data slice (can be either direct pointer to the data or a pointer to the user
+ * provided buffer, with its contents containing the data, if unable to obtain
+ * direct pointer)
+ */
+__bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr_kern *ptr, u32 offset,
+				   void *buffer, u32 buffer__sz)
+{
+	enum bpf_dynptr_type type;
+	u32 len = buffer__sz;
+	int err;
+
+	if (!ptr->data)
+		return 0;
+
+	err = bpf_dynptr_check_off_len(ptr, offset, len);
+	if (err)
+		return 0;
+
+	type = bpf_dynptr_get_type(ptr);
+
+	switch (type) {
+	case BPF_DYNPTR_TYPE_LOCAL:
+	case BPF_DYNPTR_TYPE_RINGBUF:
+		return ptr->data + ptr->offset + offset;
+	case BPF_DYNPTR_TYPE_SKB:
+		return skb_header_pointer(ptr->data, ptr->offset + offset, len, buffer);
+	case BPF_DYNPTR_TYPE_XDP:
+	{
+		void *xdp_ptr = bpf_xdp_pointer(ptr->data, ptr->offset + offset, len);
+		if (xdp_ptr)
+			return xdp_ptr;
+
+		bpf_xdp_copy_buf(ptr->data, ptr->offset + offset, buffer, len, false);
+		return buffer;
+	}
+	default:
+		WARN_ONCE(true, "unknown dynptr type %d\n", type);
+		return 0;
+	}
+}
+
+/**
+ * bpf_dynptr_slice_rdwr - Obtain a pointer to the dynptr data.
+ *
+ * For non-skb and non-xdp type dynptrs, there is no difference between
+ * bpf_dynptr_slice and bpf_dynptr_data.
+ *
+ * @ptr: The dynptr whose data slice to retrieve
+ * @offset: Offset into the dynptr
+ * @buffer: User-provided buffer to copy contents into
+ * @buffer__sz: Size (in bytes) of the buffer. This is the length of the
+ * requested slice
+ *
+ * @returns: NULL if the call failed (eg invalid dynptr), pointer to a
+ * data slice (can be either direct pointer to the data or a pointer to the user
+ * provided buffer, with its contents containing the data, if unable to obtain
+ * direct pointer)
+ */
+__bpf_kfunc void *bpf_dynptr_slice_rdwr(const struct bpf_dynptr_kern *ptr, u32 offset,
+					void *buffer, u32 buffer__sz)
+{
+	if (!ptr->data || bpf_dynptr_is_rdonly(ptr))
+		return 0;
+
+	/* bpf_dynptr_slice_rdwr is the same logic as bpf_dynptr_slice.
+	 *
+	 * For skb-type dynptrs, the verifier has already ensured that the skb
+	 * head is writable (see bpf_unclone_prologue()).
+	 */
+	return bpf_dynptr_slice(ptr, offset, buffer, buffer__sz);
+}
+
 __bpf_kfunc void *bpf_cast_to_kern_ctx(void *obj)
 {
 	return obj;
@@ -2224,6 +2312,8 @@ BTF_ID_FLAGS(func, bpf_cgroup_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_cgroup_ancestor, KF_ACQUIRE | KF_TRUSTED_ARGS | KF_RET_NULL)
 #endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_dynptr_slice, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_dynptr_slice_rdwr, KF_RET_NULL)
 BTF_SET8_END(generic_btf_ids)
 
 static const struct btf_kfunc_id_set generic_kfunc_set = {
@@ -2271,6 +2361,7 @@ static int __init kfunc_init(void)
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &generic_kfunc_set);
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
